@@ -92,14 +92,18 @@ So 100% TQQQ = 3x exposure = instant breach. Max 50% TQQQ + 50% cash works (1.5x
 
 ## Universe
 
-Curated set during v0 (real challenge expands to top ~1000 US equities by liquidity at launch):
+~140 of the most-liquid US names — the stocks and ETFs people actually trade (real challenge expands toward the top ~1000 by liquidity at launch). Anything outside the list is silently ignored. Spanning:
 
-- Mega-cap tech: AAPL MSFT GOOGL AMZN META NVDA TSLA
-- AI infra / semis: AVGO AMD MU MRVL
-- Index ETFs: SPY QQQ DIA IWM
-- Sector ETFs: XLK XLF XLE XLV XLI XLY XLP XLU XLRE XLC SMH
-- Banking: KRE JPM BAC C WFC
-- Leveraged: TQQQ SOXL UPRO SPXL QLD SSO
+- Mega-cap tech / internet: AAPL MSFT GOOGL GOOG AMZN META NVDA TSLA NFLX …
+- Semis / AI infra: AVGO AMD MU MRVL QCOM TXN INTC AMAT LRCX KLAC ADI NXPI ARM TSM
+- Software / cloud: ORCL CRM ADBE INTU NOW PANW SNOW CRWD DDOG NET SHOP UBER ABNB PYPL
+- Consumer: WMT COST HD LOW TGT NKE SBUX MCD CMG KO PEP PG CL PM MO MDLZ MNST
+- Financials: JPM BAC WFC C GS MS BLK SCHW AXP V MA COF USB PNC
+- Healthcare / pharma: UNH JNJ LLY PFE MRK ABBV ABT TMO DHR BMY AMGN GILD CVS MDT ISRG VRTX REGN
+- Industrials / energy: BA CAT GE HON UPS RTX LMT DE MMM UNP FDX XOM CVX COP SLB EOG OXY
+- Autos / popular retail: F GM PLTR COIN SOFI HOOD RBLX DKNG RIVN
+- ETFs: SPY QQQ DIA IWM VTI VOO · sectors XLK XLF XLE XLV XLI XLY XLP XLU XLRE XLC XLB · SMH SOXX IGV ARKK XBI IBB KRE GDX GLD SLV TLT HYG USO
+- Leveraged (long): TQQQ SOXL UPRO SPXL QLD SSO (3x: TQQQ/SOXL/UPRO/SPXL, 2x: QLD/SSO)
 
 Tickers outside the universe are silently ignored.
 

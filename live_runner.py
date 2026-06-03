@@ -28,9 +28,32 @@ HERE = Path(__file__).parent
 OUT = HERE / "leaderboard.json"
 
 UNIVERSE = [
-    "SPY", "QQQ", "SMH", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP",
-    "XLU", "XLRE", "XLC", "KRE", "JPM", "TQQQ", "SOXL", "QLD", "NVDA", "MSFT", "AAPL", "META",
-    "AVGO", "AMD", "MU", "MRVL",
+    # mega-cap tech / internet
+    "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "TSLA", "NFLX",
+    # semis / AI infra
+    "AVGO", "AMD", "MU", "MRVL", "QCOM", "TXN", "INTC", "AMAT", "LRCX", "KLAC", "ADI", "NXPI", "ARM", "TSM",
+    # software / cloud
+    "ORCL", "CRM", "ADBE", "INTU", "NOW", "PANW", "SNOW", "CRWD", "DDOG", "NET", "SHOP", "UBER", "ABNB", "PYPL",
+    # comms / media
+    "CMCSA", "TMUS", "VZ", "T", "DIS",
+    # consumer
+    "WMT", "COST", "HD", "LOW", "TGT", "NKE", "SBUX", "MCD", "CMG", "KO", "PEP", "PG", "CL", "PM", "MO", "MDLZ", "MNST",
+    # financials
+    "JPM", "BAC", "WFC", "C", "GS", "MS", "BLK", "SCHW", "AXP", "V", "MA", "COF", "USB", "PNC",
+    # healthcare / pharma
+    "UNH", "JNJ", "LLY", "PFE", "MRK", "ABBV", "ABT", "TMO", "DHR", "BMY", "AMGN", "GILD", "CVS", "MDT", "ISRG", "VRTX", "REGN",
+    # industrials / energy
+    "BA", "CAT", "GE", "HON", "UPS", "RTX", "LMT", "DE", "MMM", "UNP", "FDX", "XOM", "CVX", "COP", "SLB", "EOG", "OXY",
+    # autos / popular retail names
+    "F", "GM", "PLTR", "COIN", "SOFI", "HOOD", "RBLX", "DKNG", "RIVN",
+    # index ETFs
+    "SPY", "QQQ", "DIA", "IWM", "VTI", "VOO",
+    # sector ETFs
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLC", "XLB",
+    # industry / thematic ETFs
+    "SMH", "SOXX", "IGV", "ARKK", "XBI", "IBB", "KRE", "GDX", "GLD", "SLV", "TLT", "HYG", "USO",
+    # leveraged ETFs
+    "TQQQ", "SOXL", "UPRO", "SPXL", "QLD", "SSO",
 ]
 
 # The live field — file -> (display name, label). House/reference bots set the
@@ -69,34 +92,47 @@ def load_decide(filename: str):
     return mod.decide
 
 
+def _rows_from_df(df, need):
+    cols = {str(c).lower(): c for c in df.columns}
+    if not {"open", "high", "low", "close"} <= set(cols):
+        return None
+    rows = []
+    for ts, r in df.iterrows():
+        try:
+            o, h, l, c = float(r[cols["open"]]), float(r[cols["high"]]), float(r[cols["low"]]), float(r[cols["close"]])
+            vv = r[cols["volume"]] if "volume" in cols else 0
+            v = int(vv) if vv == vv else 0
+        except (KeyError, ValueError, TypeError):
+            continue
+        if any(x != x for x in (o, h, l, c)):
+            continue
+        rows.append({"ts": ts.strftime("%Y-%m-%d"), "open": o, "high": h, "low": l, "close": c, "volume": v})
+    return rows[-need:] if len(rows) >= need - 60 else None  # tolerate short histories
+
+
 def fetch_bars() -> dict[str, list[dict]]:
-    """Fetch daily bars for the universe (enough history for warmup + eval)."""
+    """Fetch daily bars for the whole universe in ONE batched call — far faster
+    and fewer rate-limit hits than a request per ticker."""
     need = EVAL_DAYS + WARMUP_DAYS + 30
     bars: dict[str, list[dict]] = {}
+    try:
+        raw = yf.download(UNIVERSE, period="2y", interval="1d", auto_adjust=True,
+                          progress=False, threads=True, group_by="ticker")
+    except Exception:
+        return bars
+    if raw is None or getattr(raw, "empty", True):
+        return bars
+    multi = hasattr(raw.columns, "nlevels") and raw.columns.nlevels > 1
     for t in UNIVERSE:
         try:
-            df = yf.download(t, period="2y", interval="1d", auto_adjust=True,
-                             progress=False, threads=False)
-        except Exception:
+            df = raw[t] if multi else raw
+        except KeyError:
             continue
         if df is None or df.empty:
             continue
-        if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
-            df.columns = [str(c[0]).lower() for c in df.columns]
-        else:
-            df.columns = [str(c).lower() for c in df.columns]
-        rows = []
-        for ts, r in df.iterrows():
-            try:
-                o, h, l, c = (float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"]))
-                v = int(r["volume"]) if r["volume"] == r["volume"] else 0
-            except (KeyError, ValueError, TypeError):
-                continue
-            if any(x != x for x in (o, h, l, c)):
-                continue
-            rows.append({"ts": ts.strftime("%Y-%m-%d"), "open": o, "high": h, "low": l, "close": c, "volume": v})
-        if len(rows) >= need - 60:  # tolerate short histories (e.g. XLC) but require most
-            bars[t] = rows[-need:]
+        r = _rows_from_df(df, need)
+        if r:
+            bars[t] = r
     return bars
 
 
