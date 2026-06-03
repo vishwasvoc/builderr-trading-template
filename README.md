@@ -98,8 +98,6 @@ The **top ~1000 US names by liquidity** — basically every stock and ETF people
 
 The exact frozen list lives in [`universe.json`](universe.json) (the board and the admission engine both read it). It includes all the obvious names — AAPL MSFT NVDA AMZN META GOOGL TSLA AMD AVGO MU MRVL QCOM PLTR COIN JPM V MA UNH LLY XOM … — plus broad/sector/thematic ETFs (SPY QQQ IWM, XLK…XLB, SMH GLD TLT …) and the long leveraged sleeves (3x: TQQQ SOXL UPRO SPXL · 2x: QLD SSO, which count 3x/2x toward the 1.5x gross cap). Regenerate with `python build_universe.py`.
 
-Tickers outside the universe are silently ignored.
-
 ---
 
 ## Scoring
