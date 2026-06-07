@@ -64,6 +64,7 @@ FIELD = [
     ("harsimran_agent.py",           "harsimran",              "round 1 · entrant"),
     ("sankeerth_agent.py",           "sankeerth",              "round 1 · entrant"),
     ("siddu_agent.py",               "siddu",                  "round 1 · entrant"),
+    ("rohit_agent.py",               "rohit",                  "round 1 · entrant"),
 ]
 
 EVAL_DAYS = 60       # (history sizing only) trailing window used when fetching bars
