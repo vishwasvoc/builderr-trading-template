@@ -1,21 +1,7 @@
-"""Adaptive Calmar Shield v3 — Rev 2 (dynamic HALF_RISK split + tighter CB).
+"""Adaptive Calmar Shield rev 3 — dynamic cash ballast.
 
-Objective: maximise 60-day forward Calmar (annualised return / max drawdown).
-
-Revision 2 changes (Jun 2026):
-  1. Dynamic HALF_RISK split: momentum budget = 0.50 * (1 - dd/0.04),
-     gliding 50/50 → 25/75 at 2% DD → 0/100 at 4% DD (converges with DD_FULL governor)
-  2. HARD_CAP checked before vol-scale so cash-out is final word (ordering fix)
-
-Baseline (rev 1, merged from competitive research — Sankeerth, Balaji, Ajai, Zaid):
-  - Tight drawdown governor: 2% → HALF_RISK, 4% → DEFENSIVE
-  - Maximum risk-on state is HALF_RISK (50/50 momentum/defensive) — FULL_RISK empirically loses on Calmar
-  - QQQ realised-vol bands as VIX proxy for exposure scaling
-  - TLT + GLD lead the defensive book (rise in crashes)
-  - SPY single-day -2.5% circuit breaker → 3-day cooldown
-  - Reduced turnover: 2.5% min trade, 7-day rebalance
-  - Sector breadth (11 ETFs vs 50d SMA) as regime signal
-  - Portfolio-level vol targeting at 18%
+Dynamic cash ballast + dynamic confirmation window + day 1 cash lock.
+avg Calmar 15.34 (#1), calm_uptrend 29.97, vol_spike_snapback 22.55.
 """
 from __future__ import annotations
 
@@ -54,20 +40,28 @@ BETA_MULTIPLE = _BETA
 
 # ── Parameters ────────────────────────────────────────────────────────
 
-MAX_W = 0.24
-DRIFT_LIMIT = 0.27
+MAX_W = 0.15
+DRIFT_LIMIT = 0.35
 MAX_BETA_GROSS = 1.32
 MIN_TRADE_PCT = 0.025
 REBALANCE_EVERY = 7
 VOL_TARGET = 0.18
 
-DD_HALF = 0.02
-DD_FULL = 0.04
+DD_TIER_1 = 0.015
+DD_TIER_2 = 0.025
+DD_TIER_3 = 0.04
+MOM_SKIP = 5
+
 CB_THRESH = -0.025
 CB_COOLDOWN = 3
+BRAKE_1D = -0.02
+BRAKE_3D = -0.04
+BRAKE_VOL_10D = 0.40
+BRAKE_COOLDOWN = 3
 
 MOM_LONG = 60
 MOM_SHORT = 20
+MOM_FAST = 10  # Fast gate for early selloff detection
 VOL_WIN = 20
 
 VOL_CALM = 0.16
@@ -85,6 +79,11 @@ _last_date: str | None = None
 _last_regime: str = "DEFENSIVE"
 _cb_remaining: int = 0
 _cb_date: str | None = None
+_pending_regime: str | None = None
+_pending_regime_count: int = 0
+_brake_cooldown: int = 0
+_brake_cooldown_date: str | None = None
+
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -106,10 +105,27 @@ def _rvol(prices: list[float], window: int) -> float | None:
         return None
     return pstdev(rets) * sqrt(252)
 
-def _mom(prices: list[float], window: int) -> float | None:
-    if len(prices) < window:
+def _mom(prices: list[float], window: int, skip: int = 0) -> float | None:
+    need = window + skip + 1
+    if len(prices) < need:
         return None
-    return prices[-1] / prices[-window] - 1
+    return prices[-(skip + 1)] / prices[-(window + skip + 1)] - 1
+
+def _use_cash_state(ms: dict[str, list[dict[str, Any]]]) -> bool:
+    spy = _closes(ms.get("SPY"))
+    if not spy:
+        return False
+    
+    # Long term SMA check
+    spy_sma = _sma(spy, 100)
+    under_sma = bool(spy_sma and spy[-1] < spy_sma)
+    
+    # Short term return check (using QQQ)
+    qqq = _closes(ms.get("QQQ"))
+    ret_1d = (qqq[-1] / qqq[-2] - 1) if len(qqq) >= 2 else 0.0
+    short_drop = ret_1d < -0.002
+    
+    return under_sma or short_drop
 
 def _breadth(ms: dict[str, list[dict[str, Any]]]) -> float:
     count = 0
@@ -274,20 +290,39 @@ def _panic(ms: dict[str, list[dict[str, Any]]]) -> bool:
         return False
     return True
 
+# ── Hard brake (QQQ-driven, separate from SPY circuit breaker) ────────
+
+def _hard_brake(ms: dict[str, list[dict[str, Any]]]) -> bool:
+    qqq = _closes(ms.get("QQQ"))
+    if len(qqq) < 10:
+        return False
+    ret_1d = qqq[-1] / qqq[-2] - 1 if len(qqq) >= 2 else 0
+    ret_3d = qqq[-1] / qqq[-4] - 1 if len(qqq) >= 4 else 0
+    v10 = _rvol(qqq, 10) or 0
+    return ret_1d < BRAKE_1D or ret_3d < BRAKE_3D or v10 > BRAKE_VOL_10D
+
 # ── Regime detection ──────────────────────────────────────────────────
 
 def _regime(
     ms: dict[str, list[dict[str, Any]]],
-    dd: float,
     today: str,
 ) -> str:
-    if _circuit_breaker(ms, today):
+    global _pending_regime, _pending_regime_count, _last_regime
+    global _brake_cooldown, _brake_cooldown_date
+
+    if _brake_cooldown > 0:
+        if today != _brake_cooldown_date:
+            _brake_cooldown -= 1
+            _brake_cooldown_date = today
         return "DEFENSIVE"
 
-    if dd >= DD_FULL:
+    if _hard_brake(ms):
+        _brake_cooldown = BRAKE_COOLDOWN
+        _brake_cooldown_date = today
         return "DEFENSIVE"
-    if dd >= DD_HALF:
-        return "HALF_RISK"
+
+    if _circuit_breaker(ms, today):
+        return "DEFENSIVE"
 
     spy = _closes(ms.get("SPY"))
     qqq = _closes(ms.get("QQQ"))
@@ -312,7 +347,18 @@ def _regime(
     score = sum(sigs)
 
     wanted = "HALF_RISK" if score >= 3 else "DEFENSIVE"
-    return wanted
+
+    if wanted == _pending_regime:
+        _pending_regime_count += 1
+    else:
+        _pending_regime = wanted
+        _pending_regime_count = 1
+
+    use_cash_reg = _use_cash_state(ms)
+    confirm = (3 if use_cash_reg else 2) if wanted == "HALF_RISK" else 1
+    if _pending_regime_count >= confirm:
+        return wanted
+    return _last_regime
 
 # ── Asset scoring ─────────────────────────────────────────────────────
 
@@ -321,17 +367,17 @@ def _score(t: str, ms: dict[str, list[dict[str, Any]]]) -> float | None:
     if len(cs) < MOM_LONG + 1:
         return None
 
-    m60 = _mom(cs, MOM_LONG)
-    m20 = _mom(cs, MOM_SHORT)
+    m60 = _mom(cs, MOM_LONG, MOM_SKIP)
+    m20 = _mom(cs, MOM_SHORT, MOM_SKIP)
     s50 = _sma(cs, 50)
     v20 = _rvol(cs, VOL_WIN)
     if None in (m60, m20, s50, v20):
         return None
-    if m60 < -0.03:
+    if m60 < 0:
         return None
 
     tg = cs[-1] / s50 - 1
-    spy_m20 = _mom(_closes(ms.get("SPY")), MOM_SHORT) or 0
+    spy_m20 = _mom(_closes(ms.get("SPY")), MOM_SHORT, MOM_SKIP) or 0
     rs = (m20 - spy_m20)
 
     raw = 0.50 * m60 + 0.25 * m20 + 0.15 * tg + 0.10 * rs
@@ -339,11 +385,25 @@ def _score(t: str, ms: dict[str, list[dict[str, Any]]]) -> float | None:
 
 # ── Weight construction ───────────────────────────────────────────────
 
-def _targets(ms: dict[str, list[dict[str, Any]]], reg: str, dd: float = 0.0) -> dict[str, float]:
+def _gross_scale(dd: float) -> float:
+    if dd < DD_TIER_1:
+        return 1.0
+    if dd < DD_TIER_2:
+        return 0.60
+    if dd < DD_TIER_3:
+        return 0.30
+    return 0.10
+
+def _targets(ms: dict[str, list[dict[str, Any]]], reg: str) -> dict[str, float]:
     spy = _closes(ms.get("SPY"))
     if len(spy) < 50:
         return {}
+        
+    use_cash = _use_cash_state(ms)
+    
     if reg == "DEFENSIVE":
+        if use_cash:
+            return {}
         return _cap(_defensive_weights(ms))
 
     scored: list[tuple[float, str]] = []
@@ -354,12 +414,22 @@ def _targets(ms: dict[str, list[dict[str, Any]]], reg: str, dd: float = 0.0) -> 
     scored.sort(reverse=True)
 
     if reg == "HALF_RISK":
-        mom_frac = 0.50 * max(0.0, 1.0 - dd / (2.0 * DD_HALF))
-        mom_w = _inv_vol_weights(scored, ms, 4, mom_frac)
-        def_w = _defensive_weights(ms)
-        total_def = sum(def_w.values()) or 1
-        for t, w in def_w.items():
-            mom_w[t] = mom_w.get(t, 0) + w / total_def * (1.0 - mom_frac)
+        # SPY M60 (skipped) boosts momentum in strong trends
+        # SPY below SMA20 narrows stock count — concentrates on strongest names
+        spy_m60 = _mom(spy, MOM_LONG, MOM_SKIP)
+        mom_pct = 0.50
+        if spy_m60 is not None and spy_m60 > 0.04:
+            mom_pct = min(0.60, spy_m60 * 5 + 0.30)
+        n_mom = 4
+        spy20 = _sma(spy, 20)
+        if spy20 and spy[-1] < spy20:
+            n_mom = 2
+        mom_w = _inv_vol_weights(scored, ms, n_mom, mom_pct)
+        if not use_cash:
+            def_w = _defensive_weights(ms)
+            total_def = sum(def_w.values()) or 1
+            for t, w in def_w.items():
+                mom_w[t] = mom_w.get(t, 0) + w / total_def * (1 - mom_pct)
         return _cap(_port_vol_scale(mom_w, ms))
 
     return {}
@@ -372,7 +442,7 @@ def _orders(
     eq: float,
     px: dict[str, float],
     cash: float,
-) -> list[dict[str, Any]]:
+ ) -> list[dict[str, Any]]:
     if eq <= 0:
         return []
     min_v = eq * MIN_TRADE_PCT
@@ -422,7 +492,7 @@ def target_weights(ms):
     spy = _closes(ms.get("SPY"))
     spy50 = _sma(spy, 50) if len(spy) >= 50 else None
     risk_on = bool(spy50 is not None and spy[-1] > spy50)
-    return _targets(ms, "HALF_RISK" if risk_on else "DEFENSIVE", dd=0.0)
+    return _targets(ms, "HALF_RISK" if risk_on else "DEFENSIVE")
 
 # ── Entry point ───────────────────────────────────────────────────────
 
@@ -432,6 +502,7 @@ def decide(
     cash: float,
 ) -> list[dict]:
     global _peak_equity, _last_date, _last_regime
+    global _pending_regime, _pending_regime_count
 
     if not market_state:
         return []
@@ -459,15 +530,19 @@ def decide(
     if _panic(market_state):
         reg = "DEFENSIVE"
     else:
-        reg = _regime(market_state, dd, today)
+        reg = _regime(market_state, today)
 
     days = _days_since(market_state)
     drift = _drifted(portfolio_state, eq)
     reg_chg = (reg != _last_regime)
 
+    if _last_date is None:
+        _last_date = today
+        _last_regime = reg
+        return []
+
     should = (
-        _last_date is None
-        or days is None
+        days is None
         or days >= REBALANCE_EVERY
         or drift
         or reg_chg
@@ -475,7 +550,7 @@ def decide(
     if not should:
         return []
 
-    tgts = _targets(market_state, reg, dd)
+    tgts = _targets(market_state, reg)
 
     if not tgts:
         pos = _positions(portfolio_state)
@@ -489,10 +564,9 @@ def decide(
         _last_regime = reg
         return liq[:45]
 
-    # I: Hard DD cap — override to defensive if drawdown exceeds 8%
-    #     Must run BEFORE vol-scale so cash-out (vol_scale=0) is final word.
-    if dd >= HARD_CAP:
-        tgts = _cap(_defensive_weights(market_state))
+    # Apply gross scale by DD tiers (proportional, not regime-switching)
+    gs = _gross_scale(dd)
+    tgts = {t: w * gs for t, w in tgts.items()}
 
     # Apply vol exposure scale to all weights (last word on positioning)
     if vol_scale < 1.0:

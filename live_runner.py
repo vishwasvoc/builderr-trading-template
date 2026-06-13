@@ -73,6 +73,10 @@ FIELD = [
     ("darshan_agent.py",             "darshan",                "round 1 · entrant"),
     ("tanishq_agent.py",             "tanishq",                "round 1 · entrant"),
     ("aarya_agent.py",               "aarya",                  "round 1 · entrant"),
+    # yog + krunal submitted the stock template strategy unmodified (allowed;
+    # told them) — identical code, so identical numbers until they iterate.
+    ("yog_agent.py",                 "yog",                    "round 1 · entrant"),
+    ("krunal_agent.py",              "krunal",                 "round 1 · entrant"),
 ]
 
 # Private entrants (read-only deploy-key path). Their CODE never enters this
