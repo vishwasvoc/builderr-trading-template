@@ -374,7 +374,7 @@ def main() -> int:
         "round_start": ROUND_START,
         "scoring": "forward-only",
         "start_cash": START_CASH,
-        "note": "Live Round 1 — forward-only scoring. Each agent starts a $100,000 paper account at the first market open AFTER it was submitted, and is scored only from there — so no one can optimise against market history they had already seen, and submitting later gives no edge. 'days' is each bot's live window so far. Same data and fills for everyone, refreshed each market day. The winner is risk-adjusted and re-checked on market windows no one has seen, so no one wins on a single lucky bet.",
+        "note": "Live Round 1 — forward-only scoring. Each agent starts a $100,000 paper account at the first market open AFTER it was submitted, and is scored only from there — so no one can optimise against market history they had already seen, and submitting later gives no edge. 'days' is each bot's live window so far. Same data and fills for everyone, refreshed each market day. The winner is the best risk-adjusted result (Calmar) over its live window — there is no historical re-run, because in trading all past data is public and fittable, so the forward window is the only real out-of-sample test. Submissions close ~3 days before the round ends, so every bot gets a minimum live window.",
         "bots": rows,
     }
     OUT.write_text(json.dumps(payload, indent=2))
