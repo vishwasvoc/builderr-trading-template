@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-06-22T10:28:35Z",
+  "generated_at_utc": "2026-06-22T12:07:09Z",
   "as_of_market_date": "2026-06-18",
   "round_start": "2026-06-02",
   "scoring": "forward-only",
@@ -936,6 +936,51 @@
       ]
     },
     {
+      "name": "ai-momentum-basket",
+      "label": "house \u00b7 aggressive",
+      "equity": 98605.87,
+      "pnl": -1394.13,
+      "ret": -0.0139,
+      "trades": 8,
+      "days": 13,
+      "since": "2026-06-01",
+      "cash": 6662.01,
+      "holdings": [
+        {
+          "t": "QQQ",
+          "q": 26.0
+        },
+        {
+          "t": "SMH",
+          "q": 24.0
+        },
+        {
+          "t": "NVDA",
+          "q": 44.0
+        },
+        {
+          "t": "MSFT",
+          "q": 21.0
+        },
+        {
+          "t": "AAPL",
+          "q": 32.0
+        },
+        {
+          "t": "TQQQ",
+          "q": 116.0
+        },
+        {
+          "t": "XLP",
+          "q": 121.0
+        },
+        {
+          "t": "XLU",
+          "q": 232.0
+        }
+      ]
+    },
+    {
       "name": "aarya",
       "label": "round 1 \u00b7 entrant",
       "equity": 98500.99,
@@ -1002,55 +1047,6 @@
         {
           "t": "AAPL",
           "q": 38.0
-        }
-      ]
-    },
-    {
-      "name": "ai-momentum-basket",
-      "label": "house \u00b7 aggressive",
-      "equity": 98088.11,
-      "pnl": -1911.89,
-      "ret": -0.0191,
-      "trades": 9,
-      "days": 13,
-      "since": "2026-06-01",
-      "cash": 0.0,
-      "holdings": [
-        {
-          "t": "QQQ",
-          "q": 26.0
-        },
-        {
-          "t": "SMH",
-          "q": 24.0
-        },
-        {
-          "t": "NVDA",
-          "q": 44.0
-        },
-        {
-          "t": "MSFT",
-          "q": 21.0
-        },
-        {
-          "t": "AAPL",
-          "q": 32.0
-        },
-        {
-          "t": "META",
-          "q": 16.0
-        },
-        {
-          "t": "TQQQ",
-          "q": 116.0
-        },
-        {
-          "t": "XLP",
-          "q": 121.0
-        },
-        {
-          "t": "XLU",
-          "q": 162.9368
         }
       ]
     },
