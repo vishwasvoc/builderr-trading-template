@@ -1,41 +1,49 @@
 """
-Simple Momentum + Risk-Off Rotation bot — builderr trading challenge.
+Momentum + Risk-Off Rotation bot — builderr trading challenge.
 
-Strategy (deliberately few moving parts):
+Strategy (still few moving parts, now with a faster safety switch):
   1. Rank a fixed basket of liquid, diversified tickers by N-day momentum.
   2. Hold the top K names, equally weighted, capped per position.
   3. Only hold a name if it's also above its own short SMA (trend filter) —
      otherwise that slot goes to cash.
-  4. Market-wide safety switch: if QQQ is below its long SMA, go to 100% cash,
-     full stop, regardless of individual stock signals.
-  5. Rebalance weekly, not daily — avoids churn, easy to stay under trade caps.
+  4. SLOW switch: if QQQ is below its long SMA, go to 100% cash.
+  5. FAST switch (new): if QQQ's recent realized volatility has spiked well
+     above its normal level, go to 100% cash immediately — this no longer
+     waits for price to cross a slow-moving average, which was the weak
+     point exposed by the vol_spike_snapback preview window.
+  6. Rebalance weekly on a normal schedule, but the cash-flip check itself
+     runs every day so a vol spike isn't missed between rebalances.
 
 No network calls. No LLM. No lookahead — every calculation only uses bars
 already given to decide() up to "today." Long-only, no leveraged ETFs used,
 so the beta-adjusted gross cap is automatically respected.
 
-Only 5 real parameters: BASKET, TOP_K, MOM_LOOKBACK, TREND_SMA, MARKET_SMA.
+7 real parameters total: BASKET, TOP_K, MOM_LOOKBACK, TREND_SMA, MARKET_SMA,
+VOL_LOOKBACK, VOL_SPIKE_MULT. Still deliberately short — every parameter
+maps to one sentence of english above.
 """
 
 from __future__ import annotations
-from statistics import mean
+from statistics import mean, pstdev
 from typing import Any
 
 # ---- Parameters (deliberately few) -----------------------------------
-BASKET = ("NVDA", "AMD", "MU", "MRVL", "AVGO", "SMH", "AAPL", "MSFT")  # candidates to rank
-MARKET_TICKER = "QQQ"        # broad market gauge for the risk-off switch
-TOP_K = 4                    # how many names to hold at once
-MAX_WEIGHT = 0.24             # cap per position (stays under the 30% rule with margin)
-MOM_LOOKBACK = 63             # ~3 months of trading days, for ranking
-TREND_SMA = 50                # per-stock trend filter length
-MARKET_SMA = 100               # risk-off switch length on QQQ
-REBALANCE_EVERY_DAYS = 5       # ~once a week
+BASKET = ("NVDA", "AMD", "MU", "MRVL", "AVGO", "SMH", "AAPL", "MSFT")
+MARKET_TICKER = "QQQ"          # broad market gauge for both risk-off switches
+TOP_K = 4                      # how many names to hold at once
+MAX_WEIGHT = 0.24              # cap per position (margin under the 30% rule)
+MOM_LOOKBACK = 63              # ~3 months of trading days, for ranking
+TREND_SMA = 50                 # per-stock trend filter length
+MARKET_SMA = 100               # slow risk-off switch length on QQQ
+VOL_LOOKBACK = 20              # window for realized volatility, both legs
+VOL_SPIKE_MULT = 1.8           # fast switch: cash if vol > MULT x its own 100d average
+REBALANCE_EVERY_DAYS = 5       # ~once a week for the momentum re-ranking
 MIN_TRADE_PCT = 0.01           # ignore rebalances smaller than 1% of equity
 
 _last_rebalance_date: str | None = None
 
 
-# ---- Small helpers ------------------------------------------------------
+# ---- Small helpers (unchanged, kept minimal) ----------------------------
 def _closes(bars: list[dict[str, Any]] | None) -> list[float]:
     if not bars:
         return []
@@ -64,6 +72,30 @@ def _momentum(values: list[float], n: int) -> float | None:
     if start <= 0:
         return None
     return values[-1] / start - 1.0
+
+
+def _daily_returns(values: list[float]) -> list[float]:
+    return [values[i] / values[i - 1] - 1.0 for i in range(1, len(values)) if values[i - 1] > 0]
+
+
+def _realized_vol(values: list[float], n: int) -> float | None:
+    """Annualized realized vol over the trailing n days."""
+    rets = _daily_returns(values)
+    if len(rets) < n:
+        return None
+    window = rets[-n:]
+    if len(window) < 2:
+        return None
+    return pstdev(window) * (252 ** 0.5)
+
+
+def _vol_is_spiking(values: list[float]) -> bool:
+    """Fast switch: today's realized vol vs. its own longer-run average."""
+    current_vol = _realized_vol(values, VOL_LOOKBACK)
+    baseline_vol = _realized_vol(values, MARKET_SMA)
+    if current_vol is None or baseline_vol is None or baseline_vol <= 0:
+        return False  # not enough history yet -> don't trigger on missing data
+    return current_vol > baseline_vol * VOL_SPIKE_MULT
 
 
 def _bar_date(market_state: dict, ticker: str) -> str | None:
@@ -116,12 +148,14 @@ def _equity(portfolio_state: dict, cash: float) -> float:
 def target_weights(market_state: dict) -> dict[str, float]:
     qqq = _closes(market_state.get(MARKET_TICKER))
     if len(qqq) < MARKET_SMA:
-        return {}  # not enough history yet — stay in cash
+        return {}  # not enough history yet -> stay in cash
 
     market_sma = _sma(qqq, MARKET_SMA)
-    risk_on = market_sma is not None and qqq[-1] > market_sma
-    if not risk_on:
-        return {}  # the one rule that matters: step aside into cash
+    slow_risk_on = market_sma is not None and qqq[-1] > market_sma
+    fast_risk_off = _vol_is_spiking(qqq)
+
+    if not slow_risk_on or fast_risk_off:
+        return {}  # either switch alone is enough to force cash
 
     scored: list[tuple[float, str]] = []
     for ticker in BASKET:
@@ -159,7 +193,6 @@ def _orders_to_rebalance(
     orders: list[dict] = []
     sell_proceeds = 0.0
 
-    # Sell anything not in targets, or trimmed down to target.
     for ticker, pos in positions.items():
         price = prices.get(ticker)
         if not price or price <= 0:
@@ -180,7 +213,6 @@ def _orders_to_rebalance(
 
     spendable = max(cash_available, 0.0) + sell_proceeds * 0.98
 
-    # Buy up to target for everything we want to hold.
     for ticker, weight in sorted(targets.items()):
         price = prices.get(ticker)
         if not price or price <= 0:
@@ -212,24 +244,31 @@ def decide(market_state: dict, portfolio_state: dict, cash: float) -> list[dict]
     if latest_date is None:
         return []
 
+    qqq = _closes(market_state.get(MARKET_TICKER))
+    fast_risk_off_today = _vol_is_spiking(qqq) if qqq else False
+
     days_since = _days_since(market_state, MARKET_TICKER, _last_rebalance_date)
-    should_rebalance = (
+    scheduled_rebalance = (
         _last_rebalance_date is None
         or days_since is None
         or days_since >= REBALANCE_EVERY_DAYS
     )
-    if not should_rebalance:
+
+    positions = _positions(portfolio_state)
+    holding_anything = len(positions) > 0
+
+    # The fast vol switch can force an off-schedule flatten on ANY day,
+    # not just rebalance days -- that's the whole point of it being fast.
+    should_act = scheduled_rebalance or (fast_risk_off_today and holding_anything)
+    if not should_act:
         return []
 
     targets = target_weights(market_state)
-
     prices = {t: _closes(b)[-1] for t, b in market_state.items() if _closes(b)}
-    positions = _positions(portfolio_state)
     total_equity = _equity(portfolio_state, cash)
 
     orders = _orders_to_rebalance(targets, positions, total_equity, prices, cash)
 
-    # Only mark "rebalanced" if we actually evaluated the book (even if that
-    # produced zero orders because we were already correctly positioned).
-    _last_rebalance_date = latest_date
+    if scheduled_rebalance:
+        _last_rebalance_date = latest_date
     return orders
