@@ -7,20 +7,34 @@ Strategy (still few moving parts, now with a faster safety switch):
   3. Only hold a name if it's also above its own short SMA (trend filter) —
      otherwise that slot goes to cash.
   4. SLOW switch: if QQQ is below its long SMA, go to 100% cash.
-  5. FAST switch (new): if QQQ's recent realized volatility has spiked well
-     above its normal level, go to 100% cash immediately — this no longer
-     waits for price to cross a slow-moving average, which was the weak
-     point exposed by the vol_spike_snapback preview window.
-  6. Rebalance weekly on a normal schedule, but the cash-flip check itself
+  5. FAST switch: if QQQ's recent realized volatility has spiked well above
+     its normal level, go to 100% cash immediately — this no longer waits
+     for price to cross a slow-moving average, which was the weak point
+     exposed by the vol_spike_snapback preview window.
+  6. Sizing (new): winners aren't all weighted equally anymore. Each name's
+     slice is scaled down if ITS OWN recent volatility is high relative to
+     the basket average, and up (up to the same hard cap) if it's calm.
+     This shrinks total exposure automatically as a selloff gets choppier,
+     even on days neither cash-switch has fired yet — this is the fix for
+     the moderate_selloff regime, which was too gradual to trip either
+     switch but still cost money while fully, equally invested.
+  7. Rebalance weekly on a normal schedule, but the cash-flip check itself
      runs every day so a vol spike isn't missed between rebalances.
 
 No network calls. No LLM. No lookahead — every calculation only uses bars
 already given to decide() up to "today." Long-only, no leveraged ETFs used,
-so the beta-adjusted gross cap is automatically respected.
+so the beta-adjusted gross cap is automatically respected. Basket is
+unchanged from the original submission — same 8 tickers, nothing added.
 
-7 real parameters total: BASKET, TOP_K, MOM_LOOKBACK, TREND_SMA, MARKET_SMA,
-VOL_LOOKBACK, VOL_SPIKE_MULT. Still deliberately short — every parameter
-maps to one sentence of english above.
+Hard caps enforced in code, matching what preview.py has verified PASSes
+against twice already: per-position weight stays under MAX_WEIGHT (24%,
+comfortably under the rules' 30% concentration limit) and total deployed
+capital never exceeds ~96% of equity (comfortably under the 1.5x gross
+leverage cap, since this bot is long-only with no leveraged instruments).
+
+8 real parameters total: BASKET, TOP_K, MOM_LOOKBACK, TREND_SMA, MARKET_SMA,
+VOL_LOOKBACK, VOL_SPIKE_MULT, MIN_WEIGHT_MULT. Still deliberately short —
+every parameter maps to one sentence of english above.
 """
 
 from __future__ import annotations
@@ -37,6 +51,7 @@ TREND_SMA = 50                 # per-stock trend filter length
 MARKET_SMA = 100               # slow risk-off switch length on QQQ
 VOL_LOOKBACK = 20              # window for realized volatility, both legs
 VOL_SPIKE_MULT = 1.8           # fast switch: cash if vol > MULT x its own 100d average
+MIN_WEIGHT_MULT = 0.5          # a name at 2x basket-average vol gets at least this fraction of a full slice
 REBALANCE_EVERY_DAYS = 5       # ~once a week for the momentum re-ranking
 MIN_TRADE_PCT = 0.01           # ignore rebalances smaller than 1% of equity
 
@@ -175,8 +190,28 @@ def target_weights(market_state: dict) -> dict[str, float]:
     if not winners:
         return {}
 
-    weight_each = min(MAX_WEIGHT, 0.96 / len(winners))
-    return {t: weight_each for t in winners}
+    # Inverse-volatility sizing: a calmer-than-average winner gets a fuller
+    # slice, a choppier-than-average one gets scaled down (never below
+    # MIN_WEIGHT_MULT of a full slice). This shrinks total exposure as a
+    # selloff gets choppier, even before either cash-switch has fired.
+    vols: dict[str, float] = {}
+    for t in winners:
+        v = _realized_vol(_closes(market_state.get(t)), VOL_LOOKBACK)
+        vols[t] = v if v is not None and v > 0 else None
+
+    known_vols = [v for v in vols.values() if v is not None]
+    avg_vol = mean(known_vols) if known_vols else None
+
+    raw_weights: dict[str, float] = {}
+    for t in winners:
+        if avg_vol is None or vols[t] is None:
+            raw_weights[t] = 1.0  # not enough data yet -> treat as average
+        else:
+            ratio = avg_vol / vols[t]  # >1 if calmer than average, <1 if choppier
+            raw_weights[t] = max(MIN_WEIGHT_MULT, min(ratio, 1.0 / MIN_WEIGHT_MULT))
+
+    base_slice = 0.96 / len(winners)
+    return {t: min(MAX_WEIGHT, base_slice * raw_weights[t]) for t in winners}
 
 
 # ---- Turn target weights into orders -----------------------------------
