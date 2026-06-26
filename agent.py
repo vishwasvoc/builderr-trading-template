@@ -13,14 +13,21 @@ Strategy (still few moving parts, now with a faster safety switch):
      exposed by the vol_spike_snapback preview window.
   6. Throttle: total exposure is scaled down smoothly when the winners, on
      average, are choppier than THEIR OWN normal history — not compared
-     to each other (fixes the basket-relative blind spot).
-  7. Structural gate (new): independent of volatility entirely, if QQQ's
-     fast 20-day SMA is below its slower 50-day SMA, exposure is cut to
-     60%. This catches a slow, steady grind-down directly on price -- the
-     gap neither the slow 100-day switch nor any volatility-based check
-     above can see, because a moderate selloff by definition doesn't spike
-     vol and hasn't yet traveled far enough to cross a 100-day average.
-  8. Rebalance weekly on a normal schedule, but the cash-flip check itself
+     to each other. This is the fix for vol_spike_snapback specifically:
+     a basket-relative comparison can't see a selloff where every name
+     gets choppier together, because the average just rises with everyone
+     in it. Comparing each name to its own past self catches that instead.
+
+     (Tried and reverted: a 20/50-day SMA crossover gate aimed at the
+     moderate_selloff regime specifically. It clipped calm_uptrend's
+     Calmar from 18.77 to 16.57 while leaving moderate_selloff completely
+     unchanged -- a pure cost with no benefit on real preview data, so it
+     was removed. moderate_selloff remains an open weak spot: three
+     different signals (fast vol-switch, vol-ratio throttle, SMA
+     crossover) have all failed to move it, which is itself useful
+     information -- whatever's driving that regime isn't a volatility or
+     trend-crossover phenomenon at these timeframes.)
+  7. Rebalance weekly on a normal schedule, but the cash-flip check itself
      runs every day so a vol spike isn't missed between rebalances.
 
 No network calls. No LLM. No lookahead — every calculation only uses bars
@@ -29,15 +36,14 @@ so the beta-adjusted gross cap is automatically respected. Basket is
 unchanged from the original submission — same 8 tickers, nothing added.
 
 Hard caps enforced in code, matching what preview.py has verified PASSes
-against twice already: per-position weight stays under MAX_WEIGHT (24%,
+against multiple times: per-position weight stays under MAX_WEIGHT (24%,
 comfortably under the rules' 30% concentration limit) and total deployed
 capital never exceeds ~96% of equity (comfortably under the 1.5x gross
 leverage cap, since this bot is long-only with no leveraged instruments).
 
-11 real parameters total: BASKET, TOP_K, MOM_LOOKBACK, TREND_SMA,
-MARKET_SMA, VOL_LOOKBACK, VOL_SPIKE_MULT, MIN_WEIGHT_MULT, FAST_TREND_SMA,
-SLOW_TREND_SMA, CROSSOVER_THROTTLE. Each still maps to one plain-english
-sentence above -- nothing hidden, nothing curve-fit to a single window.
+8 real parameters total: BASKET, TOP_K, MOM_LOOKBACK, TREND_SMA, MARKET_SMA,
+VOL_LOOKBACK, VOL_SPIKE_MULT, MIN_WEIGHT_MULT. Still deliberately short —
+every parameter maps to one sentence of english above.
 """
 
 from __future__ import annotations
@@ -55,9 +61,6 @@ MARKET_SMA = 100               # slow risk-off switch length on QQQ
 VOL_LOOKBACK = 20              # window for realized volatility, both legs
 VOL_SPIKE_MULT = 1.8           # fast switch: cash if vol > MULT x its own 100d average
 MIN_WEIGHT_MULT = 0.5          # floor for the exposure throttle (never cuts below half size)
-FAST_TREND_SMA = 20            # fast leg of the crossover gate -- catches slow grind-downs
-SLOW_TREND_SMA = 50            # slow leg of the crossover gate
-CROSSOVER_THROTTLE = 0.6       # exposure multiplier when fast SMA < slow SMA on QQQ
 REBALANCE_EVERY_DAYS = 5       # ~once a week for the momentum re-ranking
 MIN_TRADE_PCT = 0.01           # ignore rebalances smaller than 1% of equity
 
@@ -117,23 +120,6 @@ def _vol_is_spiking(values: list[float]) -> bool:
     if current_vol is None or baseline_vol is None or baseline_vol <= 0:
         return False  # not enough history yet -> don't trigger on missing data
     return current_vol > baseline_vol * VOL_SPIKE_MULT
-
-
-def _trend_is_deteriorating(values: list[float]) -> bool:
-    """Structural gate: fast SMA below slow SMA on the market gauge.
-
-    Catches a slow, steady grind-down directly on price -- no volatility
-    spike required. This is what neither the slow 100-day switch nor the
-    volatility-based fast switch/throttle can see: a moderate selloff is,
-    by definition, gradual enough that vol doesn't spike and price hasn't
-    yet traveled far enough to cross a 100-day average. A 20-day vs 50-day
-    crossover reacts to the trend itself, much sooner.
-    """
-    fast = _sma(values, FAST_TREND_SMA)
-    slow = _sma(values, SLOW_TREND_SMA)
-    if fast is None or slow is None:
-        return False
-    return fast < slow
 
 
 def _bar_date(market_state: dict, ticker: str) -> str | None:
@@ -232,15 +218,10 @@ def target_weights(market_state: dict) -> dict[str, float]:
         avg_ratio = mean(ratios)
         # avg_ratio == 1.0 (normal) -> full throttle (1.0)
         # avg_ratio == 1.0/MIN_WEIGHT_MULT or higher -> minimum throttle
-        vol_throttle = max(MIN_WEIGHT_MULT, min(1.0, 1.0 / avg_ratio)) if avg_ratio > 0 else 1.0
+        throttle = max(MIN_WEIGHT_MULT, min(1.0, 1.0 / avg_ratio)) if avg_ratio > 0 else 1.0
     else:
-        vol_throttle = 1.0  # not enough data yet -> no throttle applied
+        throttle = 1.0  # not enough data yet -> no throttle applied
 
-    # Structural gate, independent of volatility: a slow grind-down shows up
-    # here even when nothing above has fired yet.
-    trend_throttle = CROSSOVER_THROTTLE if _trend_is_deteriorating(qqq) else 1.0
-
-    throttle = vol_throttle * trend_throttle
     base_slice = (0.96 / len(winners)) * throttle
     return {t: min(MAX_WEIGHT, base_slice) for t in winners}
 
