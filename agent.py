@@ -11,13 +11,12 @@ Strategy (still few moving parts, now with a faster safety switch):
      its normal level, go to 100% cash immediately — this no longer waits
      for price to cross a slow-moving average, which was the weak point
      exposed by the vol_spike_snapback preview window.
-  6. Sizing (new): winners aren't all weighted equally anymore. Each name's
-     slice is scaled down if ITS OWN recent volatility is high relative to
-     the basket average, and up (up to the same hard cap) if it's calm.
-     This shrinks total exposure automatically as a selloff gets choppier,
-     even on days neither cash-switch has fired yet — this is the fix for
-     the moderate_selloff regime, which was too gradual to trip either
-     switch but still cost money while fully, equally invested.
+  6. Throttle (revised): total exposure is scaled down smoothly when the
+     winners, on average, are choppier than THEIR OWN normal history --
+     not compared to each other. This is the fix for moderate_selloff: a
+     basket-relative comparison can't see a selloff where every name gets
+     choppier together, because the average just rises with everyone in
+     it. Comparing each name to its own past self catches that instead.
   7. Rebalance weekly on a normal schedule, but the cash-flip check itself
      runs every day so a vol spike isn't missed between rebalances.
 
@@ -51,7 +50,7 @@ TREND_SMA = 50                 # per-stock trend filter length
 MARKET_SMA = 100               # slow risk-off switch length on QQQ
 VOL_LOOKBACK = 20              # window for realized volatility, both legs
 VOL_SPIKE_MULT = 1.8           # fast switch: cash if vol > MULT x its own 100d average
-MIN_WEIGHT_MULT = 0.5          # a name at 2x basket-average vol gets at least this fraction of a full slice
+MIN_WEIGHT_MULT = 0.5          # floor for the exposure throttle (never cuts below half size)
 REBALANCE_EVERY_DAYS = 5       # ~once a week for the momentum re-ranking
 MIN_TRADE_PCT = 0.01           # ignore rebalances smaller than 1% of equity
 
@@ -190,28 +189,31 @@ def target_weights(market_state: dict) -> dict[str, float]:
     if not winners:
         return {}
 
-    # Inverse-volatility sizing: a calmer-than-average winner gets a fuller
-    # slice, a choppier-than-average one gets scaled down (never below
-    # MIN_WEIGHT_MULT of a full slice). This shrinks total exposure as a
-    # selloff gets choppier, even before either cash-switch has fired.
-    vols: dict[str, float] = {}
+    # Exposure throttle: compare EACH winner's current vol to ITS OWN longer
+    # baseline (not to its basket neighbors). When a selloff makes the whole
+    # basket choppier together, a basket-relative comparison can't see it
+    # because everyone rises in lockstep -- comparing each name to its own
+    # history catches that. The throttle scales TOTAL exposure down smoothly
+    # as the average winner gets choppier than its own normal self, well
+    # before either hard cash-switch fires.
+    ratios: list[float] = []
     for t in winners:
-        v = _realized_vol(_closes(market_state.get(t)), VOL_LOOKBACK)
-        vols[t] = v if v is not None and v > 0 else None
+        values = _closes(market_state.get(t))
+        current_vol = _realized_vol(values, VOL_LOOKBACK)
+        own_baseline = _realized_vol(values, MARKET_SMA)
+        if current_vol is not None and own_baseline is not None and own_baseline > 0:
+            ratios.append(current_vol / own_baseline)  # >1 means choppier than usual
 
-    known_vols = [v for v in vols.values() if v is not None]
-    avg_vol = mean(known_vols) if known_vols else None
+    if ratios:
+        avg_ratio = mean(ratios)
+        # avg_ratio == 1.0 (normal) -> full throttle (1.0)
+        # avg_ratio == 1.0/MIN_WEIGHT_MULT or higher -> minimum throttle
+        throttle = max(MIN_WEIGHT_MULT, min(1.0, 1.0 / avg_ratio)) if avg_ratio > 0 else 1.0
+    else:
+        throttle = 1.0  # not enough data yet -> no throttle applied
 
-    raw_weights: dict[str, float] = {}
-    for t in winners:
-        if avg_vol is None or vols[t] is None:
-            raw_weights[t] = 1.0  # not enough data yet -> treat as average
-        else:
-            ratio = avg_vol / vols[t]  # >1 if calmer than average, <1 if choppier
-            raw_weights[t] = max(MIN_WEIGHT_MULT, min(ratio, 1.0 / MIN_WEIGHT_MULT))
-
-    base_slice = 0.96 / len(winners)
-    return {t: min(MAX_WEIGHT, base_slice * raw_weights[t]) for t in winners}
+    base_slice = (0.96 / len(winners)) * throttle
+    return {t: min(MAX_WEIGHT, base_slice) for t in winners}
 
 
 # ---- Turn target weights into orders -----------------------------------
