@@ -74,7 +74,11 @@ STOP_COOLDOWN_DAYS = 3           # days a stopped-out name is blocked from being
 SWAP_MARGIN = 0.03               # a held name needs to trail the worst NEW winner by more
                                   # than this to actually get swapped out -- stops daily
                                   # rebalancing from churning on noise right at the cutoff
-MIN_TRADE_PCT = 0.01            # ignore rebalances smaller than 1% of equity
+MIN_TRADE_PCT = 0.025            # ignore rebalances smaller than 2.5% of equity -- wide
+                                  # enough to absorb day-to-day conviction-weight wobble
+                                  # among names that all legitimately qualify (confirmed
+                                  # in testing: 1% was too tight and trimmed/re-added the
+                                  # same valid holding repeatedly on score noise alone)
 MAX_ORDERS_PER_DAY = 16         # explicit guard, comfortably under the 50/day rule cap
 
 _pos_high: dict[str, float] = {}   # tracks each held ticker's peak price since bought
@@ -132,6 +136,24 @@ def _vol_is_spiking(values: list[float]) -> bool:
     if current_vol is None or baseline_vol is None or baseline_vol <= 0:
         return False
     return current_vol > baseline_vol * VOL_SPIKE_MULT
+
+
+def _vol_regime_mult(values: list[float]) -> float:
+    """How elevated is current vol vs. its own normal baseline? 1.0 = normal.
+
+    Used to WIDEN both the swap margin and the trailing stop during choppy
+    conditions -- the exact mechanism that was missing: the bot was using
+    the same sensitivity in a calm trend and in a vol spike, and the churn
+    traced in testing happened specifically because daily rebalancing +
+    an 8% stop are tuned for normal conditions, not chop. This scales the
+    response to the data instead of hand-picking a single fixed threshold.
+    """
+    current_vol = _realized_vol(values, VOL_LOOKBACK)
+    baseline_vol = _realized_vol(values, MARKET_SMA)
+    if current_vol is None or baseline_vol is None or baseline_vol <= 0:
+        return 1.0
+    ratio = current_vol / baseline_vol
+    return max(1.0, min(ratio, 2.5))  # floor at 1.0 (never tighten below normal), cap at 2.5x
 
 
 def _fast_crash_triggered(values: list[float]) -> bool:
@@ -212,12 +234,17 @@ def target_weights(market_state: dict, held_tickers: frozenset[str] = frozenset(
     # Swap-margin hysteresis: with daily rebalancing, scores near the TOP_K
     # cutoff jostle from ordinary noise, not a real signal change. A held
     # name keeps its seat unless a candidate currently outside the top K
-    # beats it by more than SWAP_MARGIN -- this is what stops the bot from
-    # round-tripping a position on a 0.02 score wobble.
+    # beats it by more than the margin -- this is what stops the bot from
+    # round-tripping a position on a score wobble. The margin itself widens
+    # when QQQ's own volatility is elevated vs. its normal baseline, since
+    # that's exactly when score-ordering noise is largest and churn is most
+    # costly (confirmed in testing: choppy/vol-spike regimes generate the
+    # most whipsaw at a fixed margin).
+    regime_mult = _vol_regime_mult(qqq)
+    effective_margin = SWAP_MARGIN * regime_mult
+
     top = scored[:TOP_K]
     rest = scored[TOP_K:]
-    top_tickers = {t for _, t in top}
-    held_in_top = [(s, t) for s, t in top if t in held_tickers]
     held_outside = [(s, t) for s, t in rest if t in held_tickers]
 
     for score, ticker in held_outside:
@@ -226,7 +253,7 @@ def target_weights(market_state: dict, held_tickers: frozenset[str] = frozenset(
         worst_score, worst_ticker = top[-1]
         if worst_ticker in held_tickers:
             continue  # don't bump one held name for another
-        if score >= worst_score - SWAP_MARGIN:
+        if score >= worst_score - effective_margin:
             # keep the held name in instead of the marginal new winner
             top[-1] = (score, ticker)
             top.sort(reverse=True)
@@ -257,10 +284,18 @@ def target_weights(market_state: dict, held_tickers: frozenset[str] = frozenset(
 def _trailing_stop_exits(
     positions: dict[str, dict[str, float]],
     prices: dict[str, float],
+    regime_mult: float = 1.0,
 ) -> list[dict]:
-    """Sell any individual holding that's fallen TRAIL_STOP below its own peak."""
+    """Sell any individual holding that's fallen TRAIL_STOP below its own peak.
+
+    The stop distance widens with regime_mult (>=1.0) during choppy/vol-spike
+    conditions, so the same 8% threshold that makes sense in a calm trend
+    doesn't fire on ordinary chop -- confirmed in testing as a real source
+    of cost during a synthetic vol-spike window.
+    """
     global _pos_high, _stop_block
     exits: list[dict] = []
+    effective_stop = TRAIL_STOP * regime_mult
     for ticker in list(_pos_high):
         if ticker not in positions:
             del _pos_high[ticker]  # no longer held -> stop tracking
@@ -271,7 +306,7 @@ def _trailing_stop_exits(
         peak = _pos_high.get(ticker, price)
         peak = max(peak, price)
         _pos_high[ticker] = peak
-        if peak > 0 and price < peak * (1.0 - TRAIL_STOP):
+        if peak > 0 and price < peak * (1.0 - effective_stop):
             qty = int(pos["quantity"])
             if qty > 0:
                 exits.append({"ticker": ticker, "side": "sell", "quantity": qty})
@@ -357,10 +392,18 @@ def decide(market_state: dict, portfolio_state: dict, cash: float) -> list[dict]
     positions = _positions(portfolio_state)
     prices = {t: _closes(b)[-1] for t, b in market_state.items() if _closes(b)}
 
+    # Regime multiplier computed once per day from QQQ's own vol vs its
+    # baseline -- reused for both the trailing stop and (inside
+    # target_weights) the swap margin, so both widen together precisely
+    # when chop is elevated, the data-driven fix for the churn traced
+    # in testing during a synthetic vol-spike scenario.
+    qqq_closes = _closes(market_state.get(MARKET_TICKER))
+    regime_mult = _vol_regime_mult(qqq_closes) if qqq_closes else 1.0
+
     # Trailing stops checked every single day, independent of the rebalance --
     # this is the per-position "exit a real loser" mechanism, gated on an
     # actual measured drawdown from peak, not a guess.
-    stop_orders = _trailing_stop_exits(positions, prices)
+    stop_orders = _trailing_stop_exits(positions, prices, regime_mult)
     stopped_tickers = {o["ticker"] for o in stop_orders}
 
     targets = target_weights(market_state, frozenset(positions.keys()))
